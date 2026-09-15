@@ -45,6 +45,21 @@ def _latest_user_text(state: AgentState) -> str:
             return str(message.content)
     return ""
 
+def _all_user_text(state: AgentState) -> str:
+    """
+    Concatenate all human messages in the session.
+ 
+    Used during a clarification loop so that when the customer replies
+    "order O003" on turn 2, the validator sees both "I want a refund"
+    (turn 1) and "order O003" (turn 2) together. Without this, turn 2
+    would classify as intent=unknown and re-ask for clarification forever.
+    """
+    parts = [
+        str(m.content)
+        for m in state["messages"]
+        if isinstance(m, HumanMessage)
+    ]
+    return " ".join(parts)
 
 def _extract_fields(text: str) -> dict[str, str]:
     fields: dict[str, str] = {}
@@ -114,7 +129,15 @@ def _classify_intent(text: str) -> str:
 
 
 def request_validator(state: AgentState) -> dict:
-    text = _latest_user_text(state)
+    # ── Text to classify ──────────────────────────────────────────────────
+    # On the first turn, classify from the latest message only.
+    # On subsequent turns (clarification_count > 0), scan the full history
+    # so a reply like "order O003" is understood in context of the prior
+    # "I want a refund" message — without this, turn 2 always returns
+    # intent=unknown and the clarification loop never terminates.
+    in_clarification_loop = bool(state.get("clarification_count", 0))
+    text = _all_user_text(state) if in_clarification_loop else _latest_user_text(state)
+    
     intent = _classify_intent(text)
     provided_fields = _extract_fields(text)
     required_fields = REQUIRED_FIELDS[intent]
@@ -124,6 +147,13 @@ def request_validator(state: AgentState) -> dict:
         if field not in provided_fields
     ]
 
+    needs_clarification = intent == "unknown" or bool(missing_fields)
+ 
+    # Reset clarification_count when a complete, valid request is received
+    clarification_count = state.get("clarification_count", 0)
+    if not needs_clarification:
+        clarification_count = 0
+
     result = RequestIntent(
         intent=intent,
         required_fields=required_fields,
@@ -131,13 +161,14 @@ def request_validator(state: AgentState) -> dict:
         needs_clarification=(intent == "unknown" or bool(missing_fields)),
     )
 
-    return result.model_dump()
+    return {**result.model_dump(), "clarification_count": clarification_count}
 
 
 def clarification_node(state: AgentState) -> dict:
     intent = state["intent"]
     required_fields = state["required_fields"]
     provided_fields = state["provided_fields"]
+    clarification_count = state.get("clarification_count", 0)
 
     missing_fields = [
         field for field in required_fields
@@ -159,10 +190,15 @@ def clarification_node(state: AgentState) -> dict:
         requested = ", ".join(labels.get(field, field) for field in missing_fields)
         message = f"Please provide the {requested} so I can help."
 
-    return {"messages": [AIMessage(content=message)]}
+    return {
+        "messages": [AIMessage(content=message)],
+        "clarification_count": clarification_count + 1,
+    }
 
-
+MAX_CLARIFICATION_ATTEMPTS = 2
 def route_after_validation(state: AgentState) -> str:
-    if state["needs_clarification"]:
-        return "clarification_node"
-    return "agent_node"   
+    if not state["needs_clarification"]:
+        return "agent_node"                          # ← valid request
+    if state.get("clarification_count", 0) >= MAX_CLARIFICATION_ATTEMPTS:
+        return "__end__"                             # ← give up (string, not END object)
+    return "clarification_node"                      # ← ask again  
