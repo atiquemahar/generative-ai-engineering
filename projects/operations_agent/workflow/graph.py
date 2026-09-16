@@ -258,75 +258,67 @@ def retrieve_operational_data(state: WorkflowState) -> dict:
  
  
 # ── Node 3: retrieve_policy_evidence ─────────────────────────────────────────
- 
+from projects.knowledge_agent.agent.knowledge_agent import KnowledgeAgent
+
+# Intent → policy query mapping (module level — shared constant)
+POLICY_QUERY_MAP = {
+    "refund":          "What is the refund policy, return window, and manager approval threshold?",
+    "support_ticket":  "What is the support ticket escalation and priority policy?",
+    "order_status":    "What are the order fulfilment and delivery timeline policies?",
+    "shipment_status": "What are the shipping and delivery policies?",
+    "refund_policy":   "What is the refund policy and return window?",
+}
+
+# Lazy singleton — instantiated on first call, not at import time
+_knowledge_agent: KnowledgeAgent | None = None
+
+def get_knowledge_agent() -> KnowledgeAgent:
+    global _knowledge_agent
+    if _knowledge_agent is None:
+        _knowledge_agent = KnowledgeAgent()
+    return _knowledge_agent
+
+
 def retrieve_policy_evidence(state: WorkflowState) -> dict:
     """
-    Query Project 1's KnowledgeAgent for the policy relevant to this request.
- 
-    Reads:  intent (from request_validator), customer_tier, order_data
+    Query Project 1's KnowledgeAgent for policy relevant to this request.
+
+    Reads:  intent (from request_validator)
     Writes: policy_question, policy_evidence, tool_calls_made
- 
-    Day 41 implementation: returns a hard-coded policy dict that matches
-    the KnowledgeAgent.ask() response schema exactly. This stub is replaced
-    on Day 42 when the live KnowledgeAgent is wired in — the state fields
-    and the downstream calculate_eligibility interface do not change.
- 
-    The query is intent-specific:
-      - refund → "What is the refund policy and return window?"
-      - support_ticket → "What is the support escalation policy?"
-      - order/shipment → "What are the delivery and shipping policies?"
-      - fallback → generic policy query
- 
-    KnowledgeAgent.ask() response schema (Day 42 will return this live):
-        {
-            "answer":           str,
-            "supported":        bool,
-            "confidence":       "high" | "medium" | "low",
-            "sources":          list[dict],
-            "retrieval_method": str,
-            "chunks_retrieved": int,
-            "latency_ms":       float,
-        }
+
+    Day 42: live KnowledgeAgent replaces the Day 41 stub.
+    The response schema is identical — calculate_eligibility reads
+    policy_evidence["answer"] the same way as before.
     """
     intent = state.get("intent", "unknown")
- 
-    # ── Build a query targeted to the intent ─────────────────────────────────
-    query_map = {
-        "refund":         "What is the refund policy, return window, and manager approval threshold?",
-        "support_ticket": "What is the support ticket escalation and priority policy?",
-        "order_status":   "What are the order fulfilment and delivery timeline policies?",
-        "shipment_status": "What are the shipping and delivery policies?",
-        "refund_policy":  "What is the refund policy and return window?",
-    }
-    policy_question = query_map.get(
+    policy_question = POLICY_QUERY_MAP.get(
         intent,
         "What are the customer service and operational policies?"
     )
- 
-    # ── Day 41 stub — replaced by live KnowledgeAgent.ask() on Day 42 ─────────
-    # Shape matches KnowledgeAgent.ask() exactly so calculate_eligibility
-    # reads policy_evidence["answer"] the same way on Day 41 and Day 42.
-    stub_policy_evidence = {
-        "answer": (
-            "Refunds are accepted within 30 days of purchase. "
-            "Items must be unused and in original packaging. "
-            "Refunds of USD 500 or above require manager approval. "
-            "Digital products are non-refundable once downloaded."
-        ),
-        "supported":        True,
-        "confidence":       "high",
-        "sources":          [{"document": "STUB — Day 42 will return live sources"}],
-        "retrieval_method": "stub",
-        "chunks_retrieved": 0,
-        "latency_ms":       0.0,
-    }
- 
+
+    try:
+        policy_evidence = get_knowledge_agent().ask(policy_question)
+    except Exception as e:
+        # Fallback to safe defaults — never let a RAG failure block a refund decision
+        policy_evidence = {
+            "answer": (
+                "Refunds are accepted within 30 days of purchase. "
+                "Refunds of USD 500 or above require manager approval."
+            ),
+            "supported":        False,
+            "confidence":       "low",
+            "sources":          [],
+            "retrieval_method": "fallback",
+            "chunks_retrieved": 0,
+            "latency_ms":       0.0,
+            "error":            str(e),
+        }
+
     return {
-        "policy_question":    policy_question,
-        "policy_evidence":    stub_policy_evidence,
-        "tool_calls_made":    ["retrieve_policy_evidence"],
+        "policy_question": policy_question,
+        "policy_evidence": policy_evidence,
+        "tool_calls_made": ["retrieve_policy_evidence"],
     }
- 
  
 # ── Node 4: calculate_eligibility ────────────────────────────────────────────
  
