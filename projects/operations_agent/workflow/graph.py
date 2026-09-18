@@ -81,6 +81,11 @@ from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
  
 from projects.operations_agent.workflow.state import WorkflowState
 from projects.operations_agent.workflow.eligibility import calculate_refund_eligibility
+from projects.operations_agent.workflow.roles import (
+    is_action_permitted,
+    role_description,
+    DEFAULT_ROLE
+)
 from projects.operations_agent.database.engine import SessionLocal
 from projects.operations_agent.database.models import Customer, Order, AuditLog
 from projects.operations_agent.errors.handlers import is_duplicate_action, log_rejection
@@ -395,7 +400,7 @@ def route_after_eligibility(state: WorkflowState) -> str:
  
 # ── Node 5: propose_action ───────────────────────────────────────────────────
  
-_PROPOSE_SYSTEM = (
+_PROPOSE_SYSTEM_BASE = (
     "You are a customer operations assistant reviewing a service request. "
     "You have been given the customer profile, order data, shipment data, "
     "policy evidence, and an eligibility decision made by a rules engine. "
@@ -410,6 +415,7 @@ _PROPOSE_SYSTEM = (
     "For create_support_ticket, proposed_args must include: customer_id (str), issue (str), priority (str).\n"
     "For inform_only, proposed_args must be an empty dict {}.\n"
     "Do not propose a write action if eligible=False. Do not add extra keys."
+    "IMPORTANT — role-based restrictions apply. See the role context below."
 )
  
  
@@ -418,14 +424,20 @@ def propose_action(state: WorkflowState) -> dict:
     LLM synthesises the full context and proposes one action.
  
     Reads:  customer_*, order_data, shipment_data, policy_evidence,
-            eligible, ineligibility_reason, max_refund_amount, intent
+            eligible, ineligibility_reason, max_refund_amount, intent,
+            user_role (Day 43 — controls which actions the LLM may propose)
     Writes: proposed_action, proposed_args, messages (LLM reasoning)
  
-    This is the ONLY LLM call in the main execution path (after validation).
-    The LLM does not decide eligibility — that was decided by Python.
-    It chooses among: issue_refund, create_support_ticket, inform_only.
-    Its JSON output is validated before the approval gate sees it.
+    Day 43: role_description() injects the caller's permitted actions into
+    the system prompt. The LLM will not propose issue_refund for a "support"
+    role because the system prompt explicitly says it is not available.
+    role_guard (structural) catches any hallucination that slips through.
     """
+    user_role = state.get("user_role") or DEFAULT_ROLE
+
+    # Build a role-aware system prompt — tells the LLM exactly what it may propose
+    system_prompt = _PROPOSE_SYSTEM_BASE + "\n\n" + role_description(user_role)
+
     context = {
         "customer_id":          state.get("customer_id"),
         "customer_name":        state.get("customer_name"),
@@ -438,6 +450,7 @@ def propose_action(state: WorkflowState) -> dict:
         "eligible":             state.get("eligible"),
         "ineligibility_reason": state.get("ineligibility_reason"),
         "max_refund_amount":    state.get("max_refund_amount"),
+        "user_role":            user_role,
     }
  
     prompt = (
@@ -447,7 +460,7 @@ def propose_action(state: WorkflowState) -> dict:
  
     try:
         response = get_llm().invoke([
-            SystemMessage(content=_PROPOSE_SYSTEM),
+            SystemMessage(content=system_prompt),
             *state["messages"],
             AIMessage(content=prompt),   # inject context after conversation history
         ])
@@ -526,7 +539,7 @@ def human_approval_interrupt(state: WorkflowState) -> Command[Literal["execute_a
                 "approval_status": "approved",
                 "action_id":       str(uuid.uuid4()),
             },
-            goto="execute_action",
+            goto="role_guard",
         )
  
     # Rejected: log it, add message, route to communicate_result
@@ -548,6 +561,61 @@ def human_approval_interrupt(state: WorkflowState) -> Command[Literal["execute_a
         },
         goto="communicate_result",
     )
+
+# ── Node 6b: role_guard ──────────────────────────────────────────────────────
+ 
+def role_guard(state: WorkflowState) -> dict:
+    """
+    Structural role-based access check — runs AFTER human_approval_interrupt,
+    BEFORE execute_action.
+ 
+    Reads:  user_role, proposed_action, action_id
+    Writes: action_executed (False on block), execution_result, errors,
+            action_id (cleared on block), messages (denial message)
+ 
+    Why two layers (prompt + structural guard)?
+      - propose_action's system prompt tells the LLM what it may propose
+        (soft layer — good UX, prevents the LLM from offering disallowed actions)
+      - role_guard blocks execution regardless of what propose_action returned
+        (hard layer — catches LLM hallucination or any future code path that
+         bypasses the prompt constraint)
+ 
+    A "customer" role that somehow received a proposed_action="issue_refund"
+    (e.g. via a crafted session state) will be blocked here structurally.
+    The block is logged to state errors and routed to communicate_result.
+    """
+    user_role = state.get("user_role") or DEFAULT_ROLE
+    action = state.get("proposed_action", "inform_only")
+
+    if not is_action_permitted(user_role, action):
+        denial_msg = {
+            f"Action '{action}' is not permitted for role '{user_role}'. "
+            "Your account does not have permission to perform this operation."
+        }
+        return {
+            "action_executed": False,
+            "execution_result": {
+                "status": "role_denied",
+                "action":  action,
+                "user_role": user_role,
+            },
+            "errors":   [f"role_guard: {denial_msg}"],
+            "action_id": None,   # clear so audit_log does not try to record it
+            "messages": [AIMessage(content=denial_msg)],
+        }
+
+    # Role check passed — return empty dict, execute_action runs next
+    return {}
+
+def route_after_role_guard(state: WorkflowState):
+    """
+    Blocked by role_guard → communicate_result (skip execute_action).
+    Permitted             → execute_action.
+    """
+    execution_result = state.get("execution_result") or {}
+    if execution_result.get("status") == "role_denied":
+        return "communicate_result"
+    return "execute_action"
  
  
 # ── Node 7: execute_action ────────────────────────────────────────────────────
@@ -746,6 +814,7 @@ builder.add_node("retrieve_policy_evidence",  retrieve_policy_evidence)
 builder.add_node("calculate_eligibility",     calculate_eligibility)
 builder.add_node("propose_action",            propose_action)
 builder.add_node("human_approval_interrupt",  human_approval_interrupt)
+builder.add_node("role_guard",                  role_guard),
 builder.add_node("execute_action",            execute_action)
 builder.add_node("audit_log",                 audit_log)
 builder.add_node("communicate_result",        communicate_result)
@@ -782,6 +851,15 @@ builder.add_conditional_edges("calculate_eligibility", route_after_eligibility, 
 builder.add_conditional_edges("propose_action", route_after_proposal, {
     "human_approval_interrupt": "human_approval_interrupt",
     "communicate_result":       "communicate_result",
+})
+
+# human_approval_interrupt uses Command(goto=...) — no explicit edges needed.
+# After approval: role_guard checks permissions before execute_action runs.
+# Execution path:  role_guard → execute_action → audit_log → communicate_result
+#                            ↘ communicate_result (if role denied)
+builder.add_conditional_edges("role_guard", route_after_role_guard, {
+    "execute_action":   "execute_action",
+    "communicate_result": "communicate_result"
 })
 
 # human_approval_interrupt uses Command(goto=...) — no explicit edges needed here
