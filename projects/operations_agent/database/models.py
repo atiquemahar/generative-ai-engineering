@@ -59,20 +59,61 @@ class Inventory(Base):
         return f"Inventory(product_id={self.product_id!r}, stock={self.stock!r})"
 
 class AuditLog(Base):
-    __tablename__ = "audit_logs" 
+    """
+    Immutable audit record — INSERT-only. No UPDATE path exists anywhere in the codebase.
+    Every field is written once at audit_log node execution time and never changed.
 
-    id:             Mapped[int]               = mapped_column(primary_key=True)
-    action_id:      Mapped[Optional[str]]     = mapped_column(String, unique=True, nullable=True)  # ← idempotency key
-    session_id:     Mapped[Optional[str]]     = mapped_column(String) 
-    customer_id:    Mapped[Optional[str]]     = mapped_column(String)
-    action:         Mapped[Optional[str]]     = mapped_column(String)
-    tool_name:      Mapped[Optional[str]]     = mapped_column(String)
-    tool_input:     Mapped[Optional[str]]     = mapped_column(JSON) 
-    tool_output:    Mapped[Optional[str]]     = mapped_column(JSON)  
-    agent_decision: Mapped[Optional[str]]     = mapped_column(String) 
-    timestamp:      Mapped[datetime]          = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc)) 
+    action_id (UUID) is the idempotency key — unique constraint prevents
+    double-execution even on client retries.
+    """
+    __tablename__ = "audit_logs"
+
+    # ── Identity ──────────────────────────────────────────────────────────
+    id:          Mapped[int]           = mapped_column(primary_key=True, autoincrement=True)
+    action_id:   Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
+    session_id:  Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # ── Request ───────────────────────────────────────────────────────────
+    intent:       Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    request_text: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # ── Agent decision chain ──────────────────────────────────────────────
+    eligible:             Mapped[Optional[bool]] = mapped_column(nullable=True)
+    ineligibility_reason: Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    user_role:            Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    proposed_action:      Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+
+    # ── Retrieved policy evidence ─────────────────────────────────────────
+    policy_question:         Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    policy_evidence_answer:  Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    policy_confidence:       Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    policy_sources:          Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    policy_retrieval_method: Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+
+    # ── Tool execution ────────────────────────────────────────────────────
+    action:            Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    tool_name:         Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    tool_input:        Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    tool_output:       Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    action_executed:   Mapped[Optional[bool]] = mapped_column(nullable=True)
+    execution_outcome: Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+
+    # ── Approval ──────────────────────────────────────────────────────────
+    approval_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # ── Errors accumulated during this session ────────────────────────────
+    session_errors: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
+    # ── Timestamp (auto — never caller-supplied) ──────────────────────────
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
 
     def __repr__(self) -> str:
-        return f"AuditLog(id={self.id!r}, action_id={self.action_id!r}, action={self.action!r})"      
+        return (
+            f"AuditLog(id={self.id!r}, action_id={self.action_id!r}, "
+            f"action={self.action!r}, executed={self.action_executed!r})"
+        )     
 
 

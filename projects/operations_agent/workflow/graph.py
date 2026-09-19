@@ -682,45 +682,98 @@ def audit_log(state: WorkflowState) -> dict:
     """
     Write a complete, immutable audit record to the database.
  
-    Reads:  action_id, proposed_action, proposed_args, execution_result,
-            action_executed, customer_id, approval_status, intent,
-            policy_question, eligible
-    Writes: action_id (cleared to None)
+    Reads:  all state fields — every decision, every evidence artifact,
+            every execution outcome
+    Writes: action_id (cleared to None after write)
  
-    Requirements (Day 44):
-      - Every action attempt is logged — success, failure, and rejection.
-      - Records are INSERT-only. The AuditLog model has no UPDATE path.
-      - action_id is the idempotency key (unique column in audit_logs).
-      - Enough context to reconstruct the full decision chain from the log alone.
+    Immutability guarantee:
+      - INSERT-only. No UPDATE path exists in the codebase.
+      - action_id (UUID) is a unique column — safe to retry on client failure.
+      - timestamp is auto-set by the DB default, never caller-supplied.
  
-    Called after execute_action whether execution succeeded or failed.
-    Also called via communicate_result's upstream for rejected/ineligible paths
-    (see route_after_eligibility → communicate_result, which calls audit_log first).
-    Day 44 will enrich the fields stored here (retrieved evidence, token counts).
+    Fields written (Day 44 — all 9 required categories):
+      request            → intent, request_text (last user message)
+      agent decision     → eligible, ineligibility_reason, proposed_action, user_role
+      retrieved evidence → policy_question, policy_evidence_answer, policy_confidence,
+                           policy_sources, policy_retrieval_method
+      tool name          → tool_name
+      tool inputs        → tool_input (JSON)
+      tool output        → tool_output (JSON)
+      approval           → approval_status, user_role
+      timestamp          → auto
+      final action       → action, action_executed, execution_outcome
     """
     action_id        = state.get("action_id")
     execution_result = state.get("execution_result")
-    customer_id      = state.get("customer_id")
+    policy_env      = state.get("policy_evidence") or {}
+
+    # Extract last user message as request_text for the audit record
+    request_text: str | None = None
+    for msg in reversed(state.get("messages", [])):
+        if hasattr(msg, "type") and msg.type == "human":
+            request_text = str(msg.content)
+            break
+
+    # Derive a human-readable execution_outcome from execution_result
+    status = execution_result.get("status") 
+    if status == "skipped_duplicate":
+        execution_outcome = "duplicate_skipped"
+    elif status == "role_denied":
+        execution_outcome = "role_denied"
+    elif status == "execution_failed":
+        execution_outcome = f"failed: {execution_result.get('error', 'unknown')}"
+    elif state.get("action_executed") is True:
+        execution_outcome = "success"
+    elif state.get("approval_status") == "rejected":
+        execution_outcome = "rejected"
+    elif state.get("eligible") is False:
+        execution_outcome = "ineligible" 
+    else:
+        execution_outcome = "inform_only"                 
+
  
     try:
         with SessionLocal() as session:
             session.add(AuditLog(
+                # ── Identity
                 action_id=action_id,
-                customer_id=customer_id,
+                customer_id=state.get("customer_id"),
+
+                # ── Request
+                intent = state.get("intent"),
+                request_text=request_text,
+
+                # ── Agent decision chain
+                eligible = state.get("eligible"),
+                ineligibility_reason = state.get("ineligibility_reason"),
+                user_role = state.get("user_role"),
+                proposed_action = state.get("proposed_action"),
+
+                # ── Retrieved policy evidence
+                policy_question = state.get("policy_question"),
+                policy_evidence_answer = policy_env.get("answer"),
+                policy_confidence = policy_env.get("confidence"),
+                policy_sources = policy_env.get("sources"),
+                policy_retrieval_method = policy_env.get("retrieval_method"),
+
+                # ── Tool execution
                 action=state.get("proposed_action", "unknown"),
                 tool_name=state.get("proposed_action"),
                 tool_input=state.get("proposed_args"),
-                tool_output=execution_result,
-                agent_decision=(
-                    f"intent={state.get('intent')} | "
-                    f"eligible={state.get('eligible')} | "
-                    f"approval={state.get('approval_status')} | "
-                    f"policy_q={state.get('policy_question')}"
-                ),
+                tool_output=execution_result if execution_result else None,
+                action_executed = state.get("action_executed"),
+                execution_outcome = execution_outcome,
+
+                # ── Approval
+                approval_status = state.get("approval_status"),
+
+                # ── Error snapshot
+                session_errors = state.get("errors") or [],
             ))
             session.commit()
     except Exception as e:
-        # Audit failure must never crash the graph — log to state errors only
+        # Audit failure must NEVER crash the graph — customer already got their response.
+        # Log to state errors only; the session continues to communicate_result.
         return {
             "errors":    [f"audit_log: DB write failed: {e}"],
             "action_id": None,
