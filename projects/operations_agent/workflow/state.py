@@ -9,6 +9,13 @@
 #   add_messages  → conversation history (append + deduplicate by message ID)
 #   operator.add  → tool_calls_made, errors (accumulate across all turns)
 #   last-write-wins (default) → everything else
+#
+# Day 45 addition: tracing_data (Optional[dict])
+#   Accumulated by traced nodes; written to AuditLog tracing columns.
+#   Pattern used by each node that writes it:
+#       tracing = state.get("tracing_data") or {}
+#       tracing["my_key"] = value
+#       return {"tracing_data": tracing}   # replaces the whole dict (last-write-wins)
 
 from __future__ import annotations
 
@@ -92,3 +99,18 @@ class WorkflowState(TypedDict):
     # MAX_CLARIFICATION_ATTEMPTS, preventing an infinite clarification loop.
     # Reset to 0 when a complete, valid request is received.
     clarification_count: int
+
+    # ── Tracing data (Day 45 — Foundry Observability) ─────────────────────
+    # Accumulated by traced nodes via GraphTracer context manager spans.
+    # Written to audit_logs tracing columns by the audit_log node.
+    # Pattern: each node reads, merges its key, writes the whole dict back.
+    #
+    # Schema (all values are optional — nodes only write what they produce):
+    #   policy_latency_ms:          float   (retrieve_policy_evidence)
+    #   propose_action_latency_ms:  float   (propose_action)
+    #   propose_input_tokens:       int     (propose_action)
+    #   propose_output_tokens:      int     (propose_action)
+    #   communication_latency_ms:   float   (communicate_result — OTEL only, not in DB)
+    #   communication_input_tokens: int     (communicate_result — OTEL only, not in DB)
+    #   communication_output_tokens:int     (communicate_result — OTEL only, not in DB)
+    tracing_data: Optional[dict]

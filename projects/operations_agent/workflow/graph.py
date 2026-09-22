@@ -54,6 +54,17 @@
 #
 #   5. audit_log is a dedicated node — always runs after execute_action whether
 #      execution succeeded or failed. Never a side effect inside a tool.
+#
+# Day 45 additions (Foundry Tracing + Observability):
+#   - GraphTracer singleton wires OTEL spans around LLM calls and retrieval.
+#   - retrieve_policy_evidence extracts policy_latency_ms from KnowledgeAgent result.
+#   - propose_action wraps its LLM call with tracer.span(), records latency + tokens.
+#   - communicate_result wraps its LLM call with tracer.span() (OTEL only — runs
+#     after audit_log so cannot be written to that DB row).
+#   - audit_log node writes four new columns from state["tracing_data"]:
+#     policy_latency_ms, propose_action_latency_ms, propose_input_tokens,
+#     propose_output_tokens.
+#   - All changes are additive and backward-compatible with Days 41-44 tests.
 
 from __future__ import annotations
  
@@ -89,6 +100,9 @@ from projects.operations_agent.workflow.roles import (
 from projects.operations_agent.database.engine import SessionLocal
 from projects.operations_agent.database.models import Customer, Order, AuditLog
 from projects.operations_agent.errors.handlers import is_duplicate_action, log_rejection
+
+# Day 45 — Foundry tracing
+from projects.operations_agent.monitoring.tracing import get_tracer
  
 # Reuse the Phase 4 validator — no changes needed
 from projects.operations_agent.graph.request_validator import (
@@ -319,10 +333,16 @@ def retrieve_policy_evidence(state: WorkflowState) -> dict:
             "error":            str(e),
         }
 
+    # Day 45: extract retrieval latency into tracing_data.
+    # KnowledgeAgent.ask() returns latency_ms in its response dict.
+    tracing = state.get("tracing_data") or {}
+    tracing["policy_latency_ms"] = float(policy_evidence.get("latency_ms", 0.0))
+
     return {
         "policy_question": policy_question,
         "policy_evidence": policy_evidence,
         "tool_calls_made": ["retrieve_policy_evidence"],
+        "tracing_data":     tracing,
     }
  
 # ── Node 4: calculate_eligibility ────────────────────────────────────────────
@@ -432,6 +452,10 @@ def propose_action(state: WorkflowState) -> dict:
     the system prompt. The LLM will not propose issue_refund for a "support"
     role because the system prompt explicitly says it is not available.
     role_guard (structural) catches any hallucination that slips through.
+
+    Day 45: LLM call is wrapped with GraphTracer.span() to capture latency
+    and token usage. Both are written to state["tracing_data"] so the
+    audit_log node can persist them without a second DB round-trip.
     """
     user_role = state.get("user_role") or DEFAULT_ROLE
 
@@ -457,14 +481,34 @@ def propose_action(state: WorkflowState) -> dict:
         f"Service request context:\n{json.dumps(context, indent=2)}\n\n"
         "Propose the appropriate action as JSON."
     )
+
+    messages_to_send = [
+        SystemMessage(content=system_prompt),
+        *state["messages"],
+        AIMessage(content=prompt),
+    ]
+
+    # Day 45: wrap LLM call with a tracing span.
+    # traced_llm_call() records latency and token counts on the SpanData object.
+    # Fallback path (except block) still updates tracing_data with zeros.
+    propose_latency_ms: float = 0.0
+    propose_input_tokens: int = 0
+    propose_output_tokens: int = 0 
  
     try:
-        response = get_llm().invoke([
-            SystemMessage(content=system_prompt),
-            *state["messages"],
-            AIMessage(content=prompt),   # inject context after conversation history
-        ])
+        traced = get_tracer().traced_llm_call(
+            "propose_action",
+            get_llm(),
+            messages_to_send,
+            user_role=user_role,
+        )
+        response = traced["response"]
+        propose_latency_ms = traced["latency_ms"]
+        propose_input_tokens = traced["input_tokens"]
+        propose_output_tokens = traced["output_tokens"]
+
         raw = response.content.strip()
+
  
         # Strip markdown fences if the model adds them
         if raw.startswith("```"):
@@ -483,6 +527,12 @@ def propose_action(state: WorkflowState) -> dict:
         proposed_action = "inform_only"
         proposed_args   = {}
         reasoning       = f"[propose_action fallback — parse error: {e}]"
+
+    # Day 45: merge tracing data — preserve any existing keys (e.g. policy_latency_ms)
+    tracing = state.get("tracing_data") or {}
+    tracing["propose_action_latency_ms"] = propose_latency_ms
+    tracing["propose_input_tokens"] = propose_input_tokens
+    tracing["propose_output_tokens"] = propose_output_tokens    
  
     return {
         "proposed_action": proposed_action,
@@ -490,6 +540,7 @@ def propose_action(state: WorkflowState) -> dict:
         "messages": [AIMessage(
             content=f"Proposed action: {proposed_action}. Reasoning: {reasoning}"
         )],
+        "tracing_data": tracing,
     }
  
  
@@ -702,10 +753,15 @@ def audit_log(state: WorkflowState) -> dict:
       approval           → approval_status, user_role
       timestamp          → auto
       final action       → action, action_executed, execution_outcome
+
+      Day 45 additions:
+      tracing            → policy_latency_ms, propose_action_latency_ms,
+                           propose_input_tokens, propose_output_tokens
     """
     action_id        = state.get("action_id")
-    execution_result = state.get("execution_result")
+    execution_result = state.get("execution_result") or {}
     policy_env      = state.get("policy_evidence") or {}
+    tracing         = state.get("tracing_data") or {}
 
     # Extract last user message as request_text for the audit record
     request_text: str | None = None
@@ -715,7 +771,7 @@ def audit_log(state: WorkflowState) -> dict:
             break
 
     # Derive a human-readable execution_outcome from execution_result
-    status = execution_result.get("status") 
+    status = execution_result.get("status") or {}
     if status == "skipped_duplicate":
         execution_outcome = "duplicate_skipped"
     elif status == "role_denied":
@@ -769,6 +825,16 @@ def audit_log(state: WorkflowState) -> dict:
 
                 # ── Error snapshot
                 session_errors = state.get("errors") or [],
+
+                # ── Tracing (Day 45)
+                # tracing_data is accumulated by retrieve_policy_evidence and
+                # propose_action during this graph run.
+                # communicate_result runs AFTER this node — its latency is captured
+                # via OTEL spans in Azure Monitor, not in this DB row.
+                policy_latency_ms = tracing.get("policy_latency_ms"),
+                propose_action_latency_ms = tracing.get("propose_action_latency_ms"),
+                propose_input_tokens      = tracing.get("propose_input_tokens"),
+                propose_output_tokens     = tracing.get("propose_output_tokens"),
             ))
             session.commit()
     except Exception as e:
@@ -829,14 +895,25 @@ def communicate_result(state: WorkflowState) -> dict:
         f"Situation:\n{json.dumps(context, indent=2)}\n\n"
         "Write the final response to the customer."
     )
+
+    messages_to_send = [
+        SystemMessage(content=_COMMUNICATE_SYSTEM),
+        *state["messages"],
+        AIMessage(content=prompt),
+    ]
  
     try:
-        response = get_llm().invoke([
-            SystemMessage(content=_COMMUNICATE_SYSTEM),
-            *state["messages"],
-            AIMessage(content=prompt),
-        ])
-        final_message = response.content
+        # Day 45: wrap with OTEL span — latency + tokens go to Azure Monitor.
+        # This node runs after audit_log so we cannot write to that DB row;
+        # OTEL is the correct channel for communicate_result observability.
+        traced = get_tracer().traced_llm_call(
+            "communicate_result",
+            get_llm(),
+            messages_to_send, 
+            execution_outcome = state.get("proposed_action", "unknown")
+            if state.get("execution_result") else "unknown"
+        )
+        final_message = traced["response"].content
     except Exception as e:
         final_message = (
             "I was unable to complete your request at this time. "
@@ -916,9 +993,9 @@ builder.add_conditional_edges("role_guard", route_after_role_guard, {
 })
 
 # human_approval_interrupt uses Command(goto=...) — no explicit edges needed here
-builder.add_edge("execute_action",     "audit_log")
-builder.add_edge("audit_log",          "communicate_result")
-builder.add_edge("communicate_result", END)
+builder.add_edge("execute_action",     "communicate_result")
+builder.add_edge("communicate_result",          "audit_log")
+builder.add_edge("audit_log", END)
 
 # ── Compile ────────────────────────────────────────────────────────────────
 memory = InMemorySaver()

@@ -65,6 +65,12 @@ class AuditLog(Base):
 
     action_id (UUID) is the idempotency key — unique constraint prevents
     double-execution even on client retries.
+
+    Day 45 adds four tracing columns (all nullable — rows from before Day 45 keep NULL):
+      policy_latency_ms          — how long KnowledgeAgent.ask() took
+      propose_action_latency_ms  — how long the propose_action LLM call took
+      propose_input_tokens       — prompt token count for propose_action
+      propose_output_tokens      — completion token count for propose_action
     """
     __tablename__ = "audit_logs"
 
@@ -109,6 +115,22 @@ class AuditLog(Base):
     timestamp: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+
+    # ── Tracing (Day 45 — Foundry Observability) ──────────────────────────
+    # All four columns are nullable so existing rows (Days 41-44) are unaffected.
+    # Values are written by audit_log node from state["tracing_data"].
+    #
+    # policy_latency_ms:         retrieve_policy_evidence → KnowledgeAgent.ask() latency
+    # propose_action_latency_ms: propose_action → LLM call latency
+    # propose_input_tokens:      propose_action → prompt tokens (billing proxy)
+    # propose_output_tokens:     propose_action → completion tokens (billing proxy)
+    #
+    # communicate_result latency + tokens are tracked via OTEL spans only
+    # (that node runs after audit_log, so they cannot be written to this row).
+    policy_latency_ms: Mapped[Optional[float]]  = mapped_column(Float, nullable=True)
+    propose_action_latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    propose_input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    propose_output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     def __repr__(self) -> str:
         return (
