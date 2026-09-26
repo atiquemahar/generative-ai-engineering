@@ -1,0 +1,59 @@
+# .dockerignore
+# Day 46 — Dockerize
+#
+# Excludes files that must not end up in the Docker build context.
+# Smaller context = faster builds. Secrets excluded = safer images.
+#
+# Rule: the Dockerfile only needs projects/ and requirements-ops-agent.txt.
+# Everything else stays out.
+
+# ── Secrets — never in the image ──────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ── Python artefacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Development / learning files (not needed at runtime) ──────────────────────
+experiments/
+docs/
+*.md
+!README.md
+
+# ── SQLite dev databases ──────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── Docker files themselves (no recursive COPY needed) ────────────────────────
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── Other requirements files (only ops-agent file is needed in the image) ─────
+requirements.txt
+requirements-*.txt
+!requirements-ops-agent.txt

@@ -1,0 +1,93 @@
+# .github/workflows/deploy.yml
+# Day 47 — Deploy to Azure Container Apps on push to main
+#
+# Trigger: every push to `main` (or manual via workflow_dispatch).
+#
+# What it does:
+#   1. Logs in to Azure using a Service Principal (stored in GitHub Secrets)
+#   2. Builds and pushes the Docker image to ACR using `az acr build`
+#   3. Updates the running Container App to use the new image
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   AZURE_CREDENTIALS          — output of: az ad sp create-for-rbac --sdk-auth
+#   ACR_NAME                   — e.g. opsagentacr
+#   ACA_RESOURCE_GROUP         — e.g. rg-operations-agent
+#   ACA_APP_NAME               — e.g. operations-agent
+#
+# Create the Service Principal once:
+#   az ad sp create-for-rbac \
+#     --name "sp-operations-agent-deploy" \
+#     --role Contributor \
+#     --scopes /subscriptions/<YOUR_SUBSCRIPTION_ID>/resourceGroups/rg-operations-agent \
+#     --sdk-auth
+# Copy the JSON output into the AZURE_CREDENTIALS secret.
+
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "projects/operations_agent/**"
+      - "Dockerfile"
+      - "requirements-ops-agent.txt"
+  workflow_dispatch:       # allow manual trigger from GitHub UI
+
+env:
+  IMAGE_TAG: operations-agent:${{ github.sha }}
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Azure login ─────────────────────────────────────────────────────────
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ── Build + push image to ACR (no local Docker needed) ──────────────────
+      - name: Build and push image to ACR
+        run: |
+          az acr build \
+            --registry  ${{ secrets.ACR_NAME }} \
+            --image     ${{ env.IMAGE_TAG }} \
+            .
+
+      # ── Update Container App to the new image ───────────────────────────────
+      - name: Update Container App
+        run: |
+          az containerapp update \
+            --name           ${{ secrets.ACA_APP_NAME }} \
+            --resource-group ${{ secrets.ACA_RESOURCE_GROUP }} \
+            --image          "${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_TAG }}"
+
+      # ── Smoke test — verify /health returns 200 ──────────────────────────────
+      - name: Smoke test /health
+        run: |
+          FQDN=$(az containerapp show \
+            --name           ${{ secrets.ACA_APP_NAME }} \
+            --resource-group ${{ secrets.ACA_RESOURCE_GROUP }} \
+            --query          "properties.configuration.ingress.fqdn" \
+            --output         tsv)
+
+          echo "Testing https://$FQDN/health"
+
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$FQDN/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ /health returned 200"
+              exit 0
+            fi
+            echo "  Attempt $i: got $STATUS — waiting 10s"
+            sleep 10
+          done
+
+          echo "✗ /health did not return 200 after 120s"
+          exit 1

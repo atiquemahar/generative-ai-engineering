@@ -1,0 +1,39 @@
+# requirements-ops-agent.txt
+# Day 46 — Dockerize
+#
+# All runtime dependencies for the Operations Agent container.
+# Separate from the top-level requirements.txt (which covers the full monorepo).
+# Install: pip install --no-cache-dir -r requirements-ops-agent.txt
+
+# ── Graph runtime ─────────────────────────────────────────────────────────────
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+
+# ── Azure ─────────────────────────────────────────────────────────────────────
+azure-ai-projects>=2.0.0
+azure-identity
+openai>=1.0.0
+azure-search-documents>=11.4.0
+
+# ── API ───────────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0
+httpx>=0.27.0          # FastAPI TestClient transport
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+
+# ── Knowledge agent (used by retrieve_policy_evidence node) ───────────────────
+faiss-cpu>=1.7.4
+sentence-transformers>=3.0.0
+
+# ── Config / utilities ────────────────────────────────────────────────────────
+python-dotenv
+
+# ── Observability (optional — graceful fallback if absent) ────────────────────
+opentelemetry-sdk>=1.28.0
+opentelemetry-exporter-otlp>=1.28.0
+azure-monitor-opentelemetry>=1.6.4
