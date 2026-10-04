@@ -56,174 +56,205 @@ The system answers questions against enterprise policy documents using hybrid re
 
 ### 2. Customer Operations Agent
 
-A LangGraph-based operational agent designed for workflows where AI can retrieve information and propose actions, but sensitive write operations require explicit human approval.
+A LangGraph-based operational agent for customer service workflows. The agent retrieves operational data and policy evidence, runs deterministic eligibility logic, proposes actions, requires human approval for all write operations, and writes an immutable audit record.
 
-The project combines operational database tools, stateful agent workflows, deterministic eligibility logic, approval gates, idempotency protection, and audit logging.
-
-**Current capabilities**
-
-* LangGraph StateGraph
-* Typed agent state
-* Tool calling with `ToolNode`
-* Database-backed tools
-* Multi-turn state persistence
-* Human approval with `interrupt()`
-* Idempotency protection
-* Failure-mode handling
-* Agent evaluation across 40 scenarios
-* Deterministic eligibility logic
-
-**In progress**
-
-* Policy retrieval integration
-* RBAC
-* Durable audit logging
-* OpenTelemetry tracing
-* Containerization
-* Azure deployment
-* Security review
+**Key capabilities**
+ 
+- 12-node LangGraph `StateGraph` workflow
+- 3-tier role-based access control (`customer / support / supervisor`)
+- Structural human-in-the-loop approval gate — `interrupt()` cannot be bypassed by prompt
+- Deterministic eligibility engine — Python decides, LLM explains
+- Idempotent write actions via UUID `action_id` + `UNIQUE` DB constraint
+- Immutable audit log — 9-category schema, INSERT-only
+- FastAPI REST API with session management
+- Azure Container Apps deployment + Azure Key Vault secrets
+- OpenTelemetry tracing + Azure Application Insights
+- Streamlit demo UI with approval card and audit trail
 
 → [Project README](projects/operations_agent/README.md)
 
 ---
 
 ## Selected Engineering Results
+ 
+| Area | Result | Evidence |
+|---|---|---|
+| **RAG retrieval** | 100% top-5 hit rate on 31-question hard benchmark | [Retrieval benchmark](docs/day18_findings.md) |
+| **Citation integrity** | 100% citation accuracy — structurally guaranteed | [Knowledge Agent README](projects/knowledge_agent/README.md) |
+| **Agent approval compliance** | 100% across 40 evaluation scenarios | [Day 38 report](evaluations/day38_implementation_report.md) |
+| **Agent task completion** | 97.5% across 40 evaluation scenarios | [Day 38 report](evaluations/day38_implementation_report.md) |
+| **Runner errors** | 0 in the 40-scenario evaluation suite | [Day 38 report](evaluations/day38_implementation_report.md) |
+| **Security checklist** | 5/5 tools passed all 6 checklist items | [security/checklist.py](projects/operations_agent/security/checklist.py) |
+| **Injection resilience** | 8/8 attack patterns blocked structurally | [Day 49 security tests](experiments/day49_security.py) |
+| **Prompt-injection (RAG)** | 8/8 attacks blocked after defensive prompt hardening | [Knowledge Agent README](projects/knowledge_agent/README.md) |
+ 
+These are project-specific evaluation results measured against defined test sets, not claims of universal model or system performance.
 
-| Area                         | Evidence                                                                   |
-| ---------------------------- | -------------------------------------------------------------------------- |
-| **RAG retrieval**            | Hybrid retrieval achieved **100% top-5** on the 31-question hard benchmark |
-| **Citation integrity**       | **100% citation accuracy** in the canonical evaluation run                 |
-| **Prompt-injection testing** | **8/8 attacks blocked** after adding defensive prompt controls             |
-| **Agent safety**             | **100% approval compliance** across 40 evaluation scenarios                |
-| **Agent task completion**    | **97.5% task completion** across the 40-scenario evaluation                |
-| **Agent reliability**        | **0 runner errors** in the evaluation suite                                |
-
-These are project-specific evaluation results, not claims of universal model or system performance.
-
-For the complete benchmarks and failure analysis, see the evaluation documents below.
 
 ---
 
 ## Engineering Patterns
-
+ 
 ### Retrieval and Grounding
-
-I compare retrieval strategies empirically rather than assuming one approach is best.
-
-The Knowledge Agent evaluated:
-
-* Keyword/BM25
-* Vector search
-* Hybrid search
-* Hybrid + semantic ranking
-
-The hard retrieval benchmark showed keyword search dropping to **84% top-1** under vocabulary mismatch, while vector and hybrid retrieval reached **100% top-1/top-5** in the tested benchmark.
-
-→ [Retrieval benchmark](docs/day18_findings.md)
+ 
+Retrieval strategies are compared empirically. The Knowledge Agent evaluated four methods against 30 ground-truth questions:
+ 
+| Method | How it works | Top-1 (baseline) | Top-1 (hard) |
+|---|---|---|---|
+| `keyword` | BM25 full-text only | 90% | 84% |
+| `vector` | Dense vector cosine similarity | 97% | 100% |
+| `hybrid` | BM25 + vector via RRF | 97% | 100% |
+| `hybrid_semantic` | Hybrid + semantic reranker *(production default)* | 100% | 100% |
+ 
+Keyword search drops to 84% under vocabulary mismatch. `hybrid_semantic` reached 100% top-1 and top-5 on the hard benchmark.
+ 
+→ [Retrieval benchmark findings](docs/day18_findings.md)
 
 ---
 
 ### Structural Citation Integrity
-
-The source list is constructed from retrieval output rather than generated by the LLM.
-
-```text
+ 
+The citation list is constructed from retrieval metadata, never generated by the LLM:
+ 
+```
 retrieve
    ↓
-retrieved chunks
+retrieved chunks (with filename, page, section, relevance score)
    ↓
-_build_sources()
+_build_sources()   ← Python reads retrieval metadata
    ↓
-structured sources
+structured citations
 ```
-
-The model generates the answer and grounding decision, while Python constructs the citation source list from retrieved evidence.
-
-This separates citation-source construction from model generation.
-
+ 
+The LLM is asked for exactly three keys: `answer`, `supported`, `confidence`. It is never asked to list sources. Citation fabrication is structurally impossible, not just unlikely.
+ 
 → [Knowledge Agent README](projects/knowledge_agent/README.md)
 
 ---
 
 ### Human Approval for Write Actions
-
-Sensitive write operations are structurally separated from normal agent reasoning.
-
-```text
-agent
-  ↓
-proposed write action
-  ↓
-human approval
-  ├── rejected → audit → return
-  └── approved
-          ↓
-     idempotency check
-          ↓
-        execute
+ 
+The approval gate is implemented in the graph topology, not in a prompt:
+ 
 ```
-
-The approval boundary is implemented in the workflow rather than relying only on a system prompt.
-
+agent proposes write action
+   ↓
+human_approval_interrupt   ← LangGraph interrupt() — graph suspends here
+   │
+   ├── approved
+   │      ↓
+   │   role_guard           ← Python checks TOOL_PERMISSIONS
+   │      ↓
+   │   execute_action       ← only reachable through this path
+   │      ↓
+   │   audit_log
+   │      ↓
+   │   communicate_result ──► END
+   │
+   └── rejected
+          ↓
+      communicate_result ──► END
+```
+ 
+No user message, prompt injection, or LLM hallucination can route around `interrupt()`. The Day 38 evaluation confirmed **100% approval compliance** across 40 scenarios including 5 unauthorized action attempts and 2 adversarial prompts.
+ 
 → [LangGraph design decisions](docs/langgraph-design-decisions.md)
 
 ---
 
 ### Deterministic Business Logic
-
-Where a decision can be expressed as explicit business rules, Python handles the decision rather than delegating it entirely to the LLM.
-
-For example:
-
-```text
-policy evidence
-      ↓
-deterministic eligibility calculation
-      ↓
-eligible / ineligible
-      ↓
-proposed action
-      ↓
-human approval
+ 
+Where a decision can be expressed as explicit rules, Python makes the decision:
+ 
 ```
+policy evidence (from KnowledgeAgent)
+   ↓
+calculate_eligibility()   ← deterministic Python, never LLM
+   │
+   ├── ineligible ──► communicate_result (LLM explains the rule)
+   └── eligible
+         ↓
+      propose_action (LLM synthesises context and recommends action)
+         ↓
+      human_approval_interrupt
+```
+ 
+The LLM explains the result. Python controls the business decision.
 
-The LLM can explain the result, but deterministic code controls the business decision.
+---
+ 
+### Role-Based Access — Two Structural Layers
+ 
+Role enforcement uses two independent layers so a failure in one does not expose the system:
+ 
+```
+Layer 1 — propose_action system prompt
+   role_description(user_role) injected into prompt
+   LLM won't offer disallowed actions (UX layer)
+ 
+Layer 2 — role_guard node (Python)
+   is_action_permitted(role, action) — static TOOL_PERMISSIONS lookup
+   Blocks execution regardless of LLM output (structural layer)
+```
+ 
+The Day 49 security test verified 8/8 injection patterns blocked by Layer 2 without any LLM calls — the structural block is in Python and does not depend on model behaviour.
 
+---
+
+### Security — 6-Point Tool Checklist
+ 
+Every tool in the Operations Agent is registered in `security/checklist.py` with a `ToolSecurityProfile` answering six questions:
+ 
+| Question | Property | Enforced by |
+|---|---|---|
+| Who can call it? | `permitted_roles` | `role_guard` node |
+| Read or write? | `is_write` | Graph routing |
+| Approval required? | `requires_approval` | `human_approval_interrupt` |
+| Inputs validated? | `pydantic_validated` | Pydantic `args_schema` |
+| Idempotent? | `is_idempotent` | `is_duplicate_action()` + UNIQUE constraint |
+| Audit logged? | `audit_logged` | `audit_log` node |
+ 
+**All 5 tools passed all 6 checklist items.**
+ 
 ---
 
 ### Failure Handling
 
-The Operations Agent was tested against multiple failure modes, including:
-
-* Tool timeout
-* Database connection failure
-* Invalid tool arguments
-* Malformed model decisions
-* Duplicate actions
-* Approval rejection
-
-The system uses retry/fallback handling, clarification, human review, idempotency checks, and audit logging depending on the failure.
-
+### Failure Handling
+ 
+The Operations Agent was tested against multiple failure modes:
+ 
+| Failure | Handler |
+|---|---|
+| Tool timeout | RetryPolicy on `retrieve_operational_data` (max 2 attempts) |
+| DB connection failure | Exception caught, `needs_clarification=True`, retry message |
+| Invalid tool arguments | Pydantic `args_schema` — rejected before tool body runs |
+| Malformed LLM JSON | `propose_action` fallback → `inform_only`, never a write action |
+| Duplicate action | `is_duplicate_action()` skips re-execution, logs to state |
+| KnowledgeAgent failure | Conservative hardcoded fallback policy — graph never blocks |
+| Approval rejection | `log_rejection()` writes to AuditLog, routes to `communicate_result` |
+ 
 → [Agent evaluation report](evaluations/agent_eval_report.md)
 
 ---
 
 ## Technology Stack
-
-| Layer                   | Technology                              |
-| ----------------------- | --------------------------------------- |
-| **LLM & Embeddings**    | Azure OpenAI                            |
-| **AI Platform**         | Azure AI Foundry                        |
-| **Retrieval**           | Azure AI Search                         |
-| **Agent Orchestration** | LangGraph                               |
-| **Document Processing** | Docling                                 |
-| **Database**            | SQLAlchemy ORM                          |
-| **API**                 | FastAPI + Uvicorn                       |
-| **Frontend**            | Streamlit                               |
-| **Validation**          | Pydantic v2                             |
-| **Testing**             | pytest                                  |
-| **Evaluation**          | Custom Python evaluation frameworks     |
-| **Security**            | Defensive prompting + injection testing |
+ 
+| Layer | Technology |
+|---|---|
+| **LLM & Embeddings** | Azure OpenAI (`gpt-5-mini`, `text-embedding-3-small`) |
+| **AI Platform** | Azure AI Foundry |
+| **Retrieval** | Azure AI Search (HNSW vector index + semantic reranker) |
+| **Agent Orchestration** | LangGraph `StateGraph` + `InMemorySaver` |
+| **Document Processing** | Docling |
+| **Database** | SQLAlchemy ORM + SQLite / PostgreSQL |
+| **API** | FastAPI + Uvicorn |
+| **Frontend** | Streamlit |
+| **Validation** | Pydantic v2 |
+| **Secret Management** | Azure Key Vault + Managed Identity |
+| **Deployment** | Azure Container Apps + Azure Container Registry |
+| **Observability** | OpenTelemetry + Azure Application Insights |
+| **Testing** | pytest + custom evaluation frameworks |
 
 ---
 
@@ -259,30 +290,30 @@ experiments/
 
 ## Repository Structure
 
-```text
+```
 generative-ai-engineering/
 │
 ├── projects/
-│   ├── knowledge_agent/
-│   └── operations_agent/
+│   ├── knowledge_agent/          # Project 1 — RAG system (Days 16–25)
+│   └── operations_agent/         # Project 2 — LangGraph agent (Days 28–50)
 │
 ├── evaluations/
 │   ├── knowledge_agent_report_2nd_run.md
 │   ├── agent_eval_report.md
+│   ├── day38_implementation_report.md
 │   └── operations_agent_eval_set.json
 │
 ├── experiments/
-│   └── dayXX_*.py / dayXX_*.md
+│   └── dayXX_*.py / dayXX_*.md  # Daily experiment files
 │
 ├── docs/
 │   ├── engineering-journey.md
 │   ├── langgraph-design-decisions.md
 │   └── day18_findings.md
 │
-├── shared/
-│   ├── evaluation/
-│   ├── ingestion/
-│   └── tests/
+├── deploy/
+│   ├── setup_keyvault.ps1        # Key Vault + Managed Identity setup
+│   └── fix_keyvault.ps1          # Permission repair script
 │
 ├── data/
 ├── conftest.py
@@ -347,26 +378,6 @@ az login
 ```
 
 For project-specific environment variables, setup instructions, evaluation commands, and deployment details, see the individual project READMEs.
-
----
-
-## Current Focus
-
-**Project 2 — Customer Operations Agent**
-
-The current work is extending the validated LangGraph foundation into a complete business workflow combining:
-
-**Operational data → policy evidence → deterministic eligibility → proposed action → human approval → execution → audit → response**
-
-Upcoming engineering work includes:
-
-* Policy retrieval integration
-* Role-based access control
-* Durable audit logging
-* Observability/tracing
-* Containerization
-* Azure deployment
-* Security testing
 
 ---
 
