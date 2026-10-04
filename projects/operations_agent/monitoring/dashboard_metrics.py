@@ -236,7 +236,7 @@ class DashboardMetrics:
             "latency": {
                 "avg_retrieval_latency_ms": self.avg_retrieval_latency_ms(since),
                 "max_retrieval_latency_ms": self.max_retieval_latency_ms(since),
-                "avg_action_propose_action_latency_ms": self.avg_propose_action_latency_ms(since),
+                "avg_propose_action_latency_ms": self.avg_propose_action_latency_ms(since),
                 "max_propose_action_latency_ms": self.max_propose_action_latency_ms(since),
             },
             "token_usage": {
@@ -246,7 +246,7 @@ class DashboardMetrics:
                 "total_propose_output_tokens": self.total_propose_output_tokens(since),
             },
             "operational": {
-                "execute_outcome_distribution": self.execution_outcome_distribution(since),
+                "execution_outcome_distribution": self.execution_outcome_distribution(since),
                 "request_volume_by_intent": self.request_volume_by_intent(since),
                 "role_distribution": self.role_distribution(since),
                 "retrieval_method_distribution": self.retrieval_method_distribution(since),

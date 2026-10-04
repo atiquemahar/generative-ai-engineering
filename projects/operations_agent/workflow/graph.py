@@ -993,10 +993,9 @@ builder.add_conditional_edges("role_guard", route_after_role_guard, {
 })
 
 # human_approval_interrupt uses Command(goto=...) — no explicit edges needed here
-builder.add_edge("execute_action",     "communicate_result")
-builder.add_edge("communicate_result",          "audit_log")
-builder.add_edge("audit_log", END)
-
+builder.add_edge("execute_action",     "audit_log")
+builder.add_edge("audit_log",          "communicate_result")
+builder.add_edge("communicate_result", END)
 # ── Compile ────────────────────────────────────────────────────────────────
 memory = InMemorySaver()
 graph  = builder.compile(checkpointer=memory)

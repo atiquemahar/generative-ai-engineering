@@ -77,12 +77,23 @@ def get_allowed_tools(role: str | None) -> list[str]:
 
 def is_action_permitted(role: str | None, action: str) -> bool:
     """
-    Return True if the role is allowed to execute this action.
-    Read-only tools always return True — only write actions are gated.
+        Return True if the role is allowed to execute this action.
+    
+        Day 49 change — enforces ALL tools, not just write actions:
+          Before: read-only tools always returned True (structural gap).
+          After:  every tool is checked against TOOL_PERMISSIONS[role].
+    
+        This means:
+          - customer calling get_customer_db → False  (data exfiltration blocked)
+          - support calling issue_refund     → False  (write gate unchanged)
+          - supervisor calling anything      → True   (full access unchanged)
+    
+        The role_guard node calls this for every proposed action.
+        If it returns False, the node routes to an error/refusal state instead
+        of execute_action — the action is never executed regardless of LLM output.
     """
-    if action not in WRITE_ACTIONS:
-        return True # read tools are never blocked by role_guard
-    return action in get_allowed_tools(role)
+    resolved_role = role if role in TOOL_PERMISSIONS else DEFAULT_ROLE
+    return action in TOOL_PERMISSIONS[resolved_role]
 
 def role_description(role: str | None) -> str:
     """

@@ -93,7 +93,8 @@ def _classify_intent(text: str) -> str:
     if (
         "support ticket" in text
         or "create a ticket" in text
-        or ("ticket" in text and ("open" in text or "create" in text))
+        or ("ticket" in text and ("open" in text or "create" in text or "stuck" in text))
+        or ("issue" in text and "ticket" in text)
     ):
         return "support_ticket"
 
@@ -102,6 +103,8 @@ def _classify_intent(text: str) -> str:
         or "track" in text
         or "where is my package" in text
         or "where's my package" in text
+        or "where is my parcel" in text
+        or ("delivery" in text and "order" in text)
     ):
         return "shipment_status"
 
@@ -112,6 +115,17 @@ def _classify_intent(text: str) -> str:
         "order status" in text
         or "status of order" in text
         or ("has order" in text and "delivered" in text)
+        or "where is my order" in text
+        or "where's my order" in text
+        or "where is order" in text
+        or "what happened to my order" in text
+        or ("where" in text and "order" in text)
+        or ("status" in text and "order" in text)
+        or ("help" in text and "order" in text)
+        or ("issue" in text and "order" in text)
+        or ("problem" in text and "order" in text)
+        or "recent order" in text
+        or "my order" in text
     ):
         return "order_status"
 
