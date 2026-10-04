@@ -9,7 +9,7 @@ A production-pattern LangGraph workflow that handles customer service operations
 
 ## Demo
 
-**[▶ Watch the demo — Customer Operations Agent](#)**
+**[▶ Watch the demo — Customer Operations Agent](https://github.com/your-username/your-repo/releases/download/v0.2.0/Operations.Agent.Demo.video.mp4)**
 
 *Coming soon — Loom link will be added after recording.*
 
